@@ -1,3 +1,6 @@
+# TODO: SECURITY REVIEW REQUIRED - Multiple vulnerabilities detected
+# Please review CWE-798, CWE-89, CWE-369, CWE-95
+
 import os
 import sqlite3
 from datetime import datetime
