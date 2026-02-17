@@ -48,6 +48,15 @@ JIRA_CONFIG = {
 LLM_CONFIG = {
     "groq_key": os.environ.get("GROQ_API_KEY"),
     "gemini_key": os.environ.get("GEMINI_API_KEY"),
+
+# BUG 1: Hardcoded credentials (Security vulnerability - CWE-798)
+ADMIN_PASSWORD = "admin123"
+DATABASE_SECRET = "supersecretkey2024"
+API_KEY_BACKUP = "sk-proj-abc123xyz789"
+
+# BUG 2: Unused variable (Code smell)
+unused_debug_flag = True
+temp_data_holder = []
 }
 
 
@@ -110,6 +119,34 @@ def fetch_jira_issue(issue_key):
         return response.json(), None
     except Exception as e:
         return None, str(e)
+
+
+# BUG 3: SQL Injection vulnerability (CWE-89)
+def search_user_by_name_unsafe(username):
+    """VULNERABLE: Uses string formatting instead of parameterized queries."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # This is vulnerable to SQL injection!
+    query = f"SELECT * FROM users WHERE username = '{username}'"
+    cursor.execute(query)
+    result = cursor.fetchall()
+    conn.close()
+    return result
+
+
+# BUG 4: Division by zero risk (CWE-369)
+def calculate_task_completion_rate(completed, total):
+    """VULNERABLE: No check for division by zero."""
+    # This will crash if total is 0!
+    rate = (completed / total) * 100
+    return rate
+
+
+# BUG 5: Eval with user input (CWE-95 - Code Injection)
+def process_user_expression(expression):
+    """VULNERABLE: Uses eval() on user input."""
+    result = eval(expression)  # Never use eval on user input!
+    return result
 
 
 def extract_jira_description(description_raw):
