@@ -137,10 +137,11 @@ def search_user_by_name_unsafe(username):
     return result
 
 
-# BUG 4: Division by zero risk (CWE-369)
+# FIXED: Division by zero (CWE-369) - Added zero check
 def calculate_task_completion_rate(completed, total):
-    """VULNERABLE: No check for division by zero."""
-    # This will crash if total is 0!
+    """Calculate task completion rate safely."""
+    if total == 0:
+        return 0.0  # Return 0% if no tasks exist
     rate = (completed / total) * 100
     return rate
 
