@@ -298,6 +298,267 @@ def create_app() -> Flask:
         session["user_mode"] = user_mode
         return redirect(request.referrer or url_for("home"))
 
+    @app.post("/chat-assistant")
+    @login_required
+    def chat_assistant():
+        """
+        Chat assistant endpoint that uses LLM to understand user's issue
+        and automatically creates a JIRA defect with screenshot and logs.
+        """
+        import json as json_lib
+        import base64
+        import tempfile
+        
+        data = request.get_json()
+        user_message = data.get("message", "").strip()
+        page_url = data.get("page_url", "/")
+        page_title = data.get("page_title", "Unknown Page")
+        captured_errors = data.get("captured_errors", [])
+        screenshot_data = data.get("screenshot")  # Base64 encoded screenshot
+        
+        if not user_message:
+            return json_lib.dumps({"success": False, "error": "Please describe the issue"})
+        
+        # Check if JIRA is configured
+        if not is_jira_configured():
+            return json_lib.dumps({"success": False, "error": "JIRA is not configured"})
+        
+        # Check if LLM is configured
+        if not LLM_CONFIG["groq_key"]:
+            return json_lib.dumps({"success": False, "error": "LLM is not configured"})
+        
+        try:
+            from groq import Groq
+            import httpx
+            
+            # Format captured errors for context
+            error_context = ""
+            if captured_errors:
+                error_context = "\n\nCaptured Browser Errors:\n"
+                for i, err in enumerate(captured_errors[:5], 1):  # Limit to 5 errors
+                    error_context += f"{i}. [{err.get('type', 'error')}] {err.get('message', 'Unknown')[:200]}\n"
+            
+            # Create prompt for LLM to extract defect details AND suggest owner
+            system_prompt = """You are a helpful assistant that creates JIRA defect tickets from user descriptions.
+
+When a user describes an issue, extract the following information and respond in JSON format:
+{
+    "should_create_defect": true/false,
+    "summary": "Brief one-line summary of the defect (max 100 chars)",
+    "description": "Detailed description including steps to reproduce if available",
+    "priority": "High/Medium/Low",
+    "issue_type": "Bug",
+    "suggested_owner": "Team or role that should fix this (e.g., Frontend Team, Backend Team, Database Team, DevOps, QA Team)"
+}
+
+Based on the error type, suggest who should fix it:
+- JavaScript/UI errors -> "Frontend Team"
+- API/Server errors (500, 503) -> "Backend Team"
+- Database errors -> "Database Team"
+- Authentication errors -> "Security Team"
+- Performance/timeout issues -> "DevOps Team"
+- General bugs -> "Development Team"
+
+If the user is just asking a question or chatting (not reporting a bug), set should_create_defect to false and include a "chat_response" field with your helpful response.
+
+Be concise and professional. Extract key details from the user's message."""
+
+            user_prompt = f"""User reported an issue on page: {page_title} ({page_url})
+
+User's message: {user_message}
+{error_context}
+
+Analyze this and respond with JSON."""
+
+            http_client = httpx.Client(verify=False)
+            groq_client = Groq(api_key=LLM_CONFIG["groq_key"], http_client=http_client)
+            
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=500
+            )
+            
+            llm_response = response.choices[0].message.content.strip()
+            
+            # Parse LLM response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', llm_response)
+            if not json_match:
+                return json_lib.dumps({
+                    "success": True,
+                    "response": "I couldn't understand that. Could you describe the issue in more detail?"
+                })
+            
+            parsed = json_lib.loads(json_match.group())
+            
+            # Check if we should create a defect
+            if not parsed.get("should_create_defect", False):
+                return json_lib.dumps({
+                    "success": True,
+                    "response": parsed.get("chat_response", "How can I help you report an issue?")
+                })
+            
+            # Create JIRA defect
+            summary = parsed.get("summary", user_message[:100])
+            description = parsed.get("description", user_message)
+            suggested_owner = parsed.get("suggested_owner", "Development Team")
+            
+            # Build full description with context (plain text, no markdown)
+            full_description = f"""Issue Description:
+{description}
+
+Page: {page_title} ({page_url})
+Reported by: {current_user.username}
+Timestamp: {datetime.utcnow().isoformat()}
+
+Suggested Owner: {suggested_owner}
+"""
+            if captured_errors:
+                full_description += "\nCaptured Browser Errors:\n"
+                for err in captured_errors[:5]:
+                    full_description += f"- [{err.get('type')}] {err.get('message', '')[:200]}\n"
+            
+            # Call JIRA API to create defect
+            from shared.atlassian_client import get_client
+            atlassian_client = get_client()
+            
+            jira_result = atlassian_client.create_jira_issue(
+                summary=summary,
+                description=full_description,
+                issue_type="Task",
+                priority=None
+            )
+            
+            if not jira_result.get("success"):
+                return json_lib.dumps({
+                    "success": False,
+                    "error": jira_result.get("error", "Failed to create JIRA defect")
+                })
+            
+            jira_key = jira_result.get("key")
+            screenshot_attached = False
+            logs_attached = False
+            
+            # Attach screenshot if available
+            if screenshot_data and jira_key:
+                try:
+                    # Remove data URL prefix if present
+                    if screenshot_data.startswith('data:'):
+                        screenshot_data = screenshot_data.split(',')[1]
+                    
+                    # Decode base64 to bytes
+                    screenshot_bytes = base64.b64decode(screenshot_data)
+                    
+                    # Create temp file
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                        tmp_file.write(screenshot_bytes)
+                        tmp_path = tmp_file.name
+                    
+                    # Upload to JIRA
+                    attach_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue/{jira_key}/attachments"
+                    attach_headers = {
+                        "Accept": "application/json",
+                        "X-Atlassian-Token": "no-check"
+                    }
+                    
+                    with open(tmp_path, 'rb') as f:
+                        files = {'file': ('screenshot.png', f, 'image/png')}
+                        attach_response = requests.post(
+                            attach_url,
+                            headers=attach_headers,
+                            files=files,
+                            auth=get_jira_auth(),
+                            verify=False
+                        )
+                        if attach_response.status_code == 200:
+                            screenshot_attached = True
+                    
+                    # Clean up temp file
+                    import os
+                    os.unlink(tmp_path)
+                    
+                except Exception as e:
+                    print(f"Screenshot attachment failed: {e}")
+            
+            # Attach error logs if available
+            if captured_errors and jira_key:
+                try:
+                    # Create log content
+                    log_content = f"Error Log for {jira_key}\n"
+                    log_content += f"Page: {page_title} ({page_url})\n"
+                    log_content += f"Timestamp: {datetime.utcnow().isoformat()}\n"
+                    log_content += f"Reported by: {current_user.username}\n"
+                    log_content += "=" * 50 + "\n\n"
+                    
+                    for i, err in enumerate(captured_errors, 1):
+                        log_content += f"ERROR {i}:\n"
+                        log_content += f"  Type: {err.get('type', 'unknown')}\n"
+                        log_content += f"  Message: {err.get('message', 'No message')}\n"
+                        log_content += f"  URL: {err.get('url', 'N/A')}\n"
+                        log_content += f"  Timestamp: {err.get('timestamp', 'N/A')}\n"
+                        if err.get('source'):
+                            log_content += f"  Source: {err.get('source')}\n"
+                        if err.get('line'):
+                            log_content += f"  Line: {err.get('line')}\n"
+                        log_content += "\n"
+                    
+                    # Create temp file
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as tmp_file:
+                        tmp_file.write(log_content)
+                        tmp_path = tmp_file.name
+                    
+                    # Upload to JIRA
+                    attach_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue/{jira_key}/attachments"
+                    attach_headers = {
+                        "Accept": "application/json",
+                        "X-Atlassian-Token": "no-check"
+                    }
+                    
+                    with open(tmp_path, 'rb') as f:
+                        files = {'file': ('error_logs.txt', f, 'text/plain')}
+                        attach_response = requests.post(
+                            attach_url,
+                            headers=attach_headers,
+                            files=files,
+                            auth=get_jira_auth(),
+                            verify=False
+                        )
+                        if attach_response.status_code == 200:
+                            logs_attached = True
+                    
+                    # Clean up temp file
+                    import os
+                    os.unlink(tmp_path)
+                    
+                except Exception as e:
+                    print(f"Log attachment failed: {e}")
+            
+            return json_lib.dumps({
+                "success": True,
+                "jira_key": jira_key,
+                "jira_url": jira_result.get("url"),
+                "summary": summary,
+                "screenshot_attached": screenshot_attached,
+                "logs_attached": logs_attached,
+                "suggested_owner": suggested_owner
+            })
+                
+        except json_lib.JSONDecodeError as e:
+            return json_lib.dumps({
+                "success": True,
+                "response": "I understand you're reporting an issue. Could you provide more specific details about what went wrong?"
+            })
+        except Exception as e:
+            return json_lib.dumps({
+                "success": False,
+                "error": f"Error: {str(e)[:100]}"
+            })
+
     @app.post("/generate-test-case")
     @login_required
     def generate_test_case():

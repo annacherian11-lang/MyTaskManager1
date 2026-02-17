@@ -7,8 +7,96 @@
           <h2 class="h4 text-white fw-semibold mb-0">{% if mode == 'personal' %}My Family Members{% else %}Manage my people{% endif %}</h2>
           <div class="text-soft small">{% if mode == 'personal' %}Add family members.{% else %}Add people and mark if they are Direct Reports (DR).{% endif %}</div>
         </div>
-        <a class="btn btn-sm btn-outline-light" href="{{ url_for('home') }}">Back</a>
+        <div class="d-flex gap-2">
+          <!-- DEMO: Buggy button for testing chat assistant -->
+          <button class="btn btn-sm btn-danger" onclick="triggerBuggyExport()" title="This button has a bug!">
+            Export Data (Buggy)
+          </button>
+          <a class="btn btn-sm btn-outline-light" href="{{ url_for('home') }}">Back</a>
+        </div>
       </div>
+      
+      <!-- DEMO ERROR: Intentional error for testing chat assistant -->
+      <script>
+        // Simulated bug: Error on page load
+        setTimeout(function() {
+          console.error("DatabaseConnectionError: Failed to sync people data with remote server - connection timeout after 30s");
+        }, 1000);
+        
+        // Buggy export function - captures screenshot WITH alert visible
+        async function triggerBuggyExport() {
+          try {
+            // Simulate a bug - accessing undefined property
+            const userData = null;
+            const exportData = userData.people.map(p => p.name); // This will throw!
+          } catch (e) {
+            console.error("ExportError: Cannot read properties of null (reading 'people') - Export failed");
+            
+            // Create a custom error overlay that stays visible (instead of alert)
+            showErrorOverlay("Export Failed!", "Error: Cannot read properties of null (reading 'people')\n\nThe export functionality encountered a null reference exception.");
+            
+            throw new Error("Export functionality is broken - null reference exception");
+          }
+        }
+        
+        // Show error overlay that can be captured in screenshot
+        function showErrorOverlay(title, message) {
+          // Remove existing overlay if any
+          const existing = document.getElementById('error-overlay');
+          if (existing) existing.remove();
+          
+          // Create overlay
+          const overlay = document.createElement('div');
+          overlay.id = 'error-overlay';
+          overlay.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a2e;
+            border: 2px solid #dc3545;
+            border-radius: 12px;
+            padding: 24px;
+            z-index: 9999;
+            max-width: 450px;
+            box-shadow: 0 10px 40px rgba(220, 53, 69, 0.4);
+          `;
+          
+          overlay.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 16px;">
+              <span style="font-size: 32px;">❌</span>
+              <h3 style="color: #dc3545; margin: 0; font-size: 20px;">${title}</h3>
+            </div>
+            <p style="color: #e0e0e0; margin: 0 0 16px 0; white-space: pre-wrap; font-size: 14px;">${message}</p>
+            <p style="color: #a78bfa; margin: 0 0 16px 0; font-size: 13px;">
+              💡 Use the chat assistant (purple button) to report this issue.
+            </p>
+            <button onclick="closeErrorOverlay()" style="
+              background: #dc3545;
+              color: white;
+              border: none;
+              padding: 10px 24px;
+              border-radius: 6px;
+              cursor: pointer;
+              font-weight: 600;
+            ">Dismiss</button>
+          `;
+          
+          document.body.appendChild(overlay);
+          
+          // Capture screenshot with overlay visible
+          setTimeout(() => {
+            if (typeof captureErrorScreenshot === 'function') {
+              captureErrorScreenshot();
+            }
+          }, 100);
+        }
+        
+        function closeErrorOverlay() {
+          const overlay = document.getElementById('error-overlay');
+          if (overlay) overlay.remove();
+        }
+      </script>
 
       <div class="rounded-4 bg-blur text-white p-3 p-md-4 mb-3">
         <form method="post" action="{{ url_for('add_person') }}" class="row g-3 align-items-end">

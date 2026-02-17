@@ -234,15 +234,31 @@ class AtlassianClient:
             }
             
             if description:
+                # Convert multi-line description to ADF format
+                # Split by newlines and create paragraphs
+                lines = description.split('\n')
+                content_blocks = []
+                
+                for line in lines:
+                    if line.strip():  # Non-empty line
+                        content_blocks.append({
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": line}]
+                        })
+                    else:  # Empty line - add empty paragraph for spacing
+                        content_blocks.append({
+                            "type": "paragraph",
+                            "content": []
+                        })
+                
+                # Ensure at least one paragraph
+                if not content_blocks:
+                    content_blocks = [{"type": "paragraph", "content": [{"type": "text", "text": description}]}]
+                
                 payload["fields"]["description"] = {
                     "type": "doc",
                     "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": description}]
-                        }
-                    ]
+                    "content": content_blocks
                 }
             
             if priority:

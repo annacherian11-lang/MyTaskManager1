@@ -231,6 +231,458 @@
     </script>
     {% endif %}
     
+    <!-- Chat Assistant Panel (Lower Left) -->
+    {% if current_user.is_authenticated and session.get('mode', 'work') == 'work' %}
+    <style>
+      .chat-assistant-btn {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 1000;
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%);
+        border: none;
+        box-shadow: 0 4px 15px rgba(124, 58, 237, 0.4);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .chat-assistant-btn:hover {
+        transform: scale(1.1);
+        box-shadow: 0 6px 20px rgba(124, 58, 237, 0.6);
+      }
+      .chat-assistant-btn svg {
+        width: 28px;
+        height: 28px;
+        fill: white;
+      }
+      .chat-panel {
+        position: fixed;
+        bottom: 90px;
+        right: 20px;
+        width: 380px;
+        max-height: 500px;
+        background: rgba(20, 20, 35, 0.95);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(124, 58, 237, 0.3);
+        border-radius: 16px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        z-index: 1001;
+        display: none;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .chat-panel.open {
+        display: flex;
+      }
+      .chat-header {
+        padding: 16px;
+        background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%);
+        color: white;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .chat-header-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .chat-close-btn {
+        background: none;
+        border: none;
+        color: white;
+        cursor: pointer;
+        font-size: 20px;
+        padding: 0;
+        line-height: 1;
+      }
+      .chat-messages {
+        flex: 1;
+        padding: 16px;
+        overflow-y: auto;
+        max-height: 300px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .chat-message {
+        padding: 10px 14px;
+        border-radius: 12px;
+        max-width: 85%;
+        font-size: 14px;
+        line-height: 1.4;
+      }
+      .chat-message.user {
+        background: #7c3aed;
+        color: white;
+        align-self: flex-end;
+        border-bottom-right-radius: 4px;
+      }
+      .chat-message.assistant {
+        background: rgba(255, 255, 255, 0.1);
+        color: #e0e0e0;
+        align-self: flex-start;
+        border-bottom-left-radius: 4px;
+      }
+      .chat-message.error {
+        background: rgba(220, 53, 69, 0.2);
+        color: #ff6b7a;
+        border: 1px solid rgba(220, 53, 69, 0.3);
+      }
+      .chat-message.success {
+        background: rgba(25, 135, 84, 0.2);
+        color: #75d9a3;
+        border: 1px solid rgba(25, 135, 84, 0.3);
+      }
+      .chat-message a {
+        color: #a78bfa;
+        text-decoration: underline;
+      }
+      .chat-input-area {
+        padding: 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        display: flex;
+        gap: 8px;
+      }
+      .chat-input {
+        flex: 1;
+        padding: 10px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.05);
+        color: white;
+        font-size: 14px;
+        outline: none;
+      }
+      .chat-input::placeholder {
+        color: rgba(255, 255, 255, 0.4);
+      }
+      .chat-input:focus {
+        border-color: #7c3aed;
+      }
+      .chat-send-btn {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: #7c3aed;
+        border: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.2s;
+      }
+      .chat-send-btn:hover {
+        background: #6d28d9;
+      }
+      .chat-send-btn:disabled {
+        background: #4a4a5a;
+        cursor: not-allowed;
+      }
+      .chat-send-btn svg {
+        width: 18px;
+        height: 18px;
+        fill: white;
+      }
+      .chat-typing {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 10px 14px;
+      }
+      .chat-typing span {
+        width: 8px;
+        height: 8px;
+        background: #7c3aed;
+        border-radius: 50%;
+        animation: typing 1.4s infinite;
+      }
+      .chat-typing span:nth-child(2) { animation-delay: 0.2s; }
+      .chat-typing span:nth-child(3) { animation-delay: 0.4s; }
+      @keyframes typing {
+        0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+        30% { transform: translateY(-4px); opacity: 1; }
+      }
+      .error-capture-badge {
+        background: #dc3545;
+        color: white;
+        font-size: 10px;
+        padding: 2px 6px;
+        border-radius: 10px;
+        position: absolute;
+        top: -5px;
+        right: -5px;
+      }
+    </style>
+    
+    <!-- Chat Toggle Button -->
+    <button id="chat-assistant-btn" class="chat-assistant-btn" onclick="toggleChatPanel()" title="Report Issue Assistant">
+      <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/><path d="M7 9h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2z"/></svg>
+      <span id="error-badge" class="error-capture-badge" style="display: none;">0</span>
+    </button>
+    
+    <!-- Chat Panel -->
+    <div id="chat-panel" class="chat-panel">
+      <div class="chat-header">
+        <div class="chat-header-title">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+          Issue Reporter
+        </div>
+        <button class="chat-close-btn" onclick="toggleChatPanel()">&times;</button>
+      </div>
+      
+      <div id="chat-messages" class="chat-messages">
+        <div class="chat-message assistant">
+          Hi! I can help you report issues directly to JIRA. Describe what went wrong and I'll create a defect for you.
+        </div>
+      </div>
+      
+      <div class="chat-input-area">
+        <input type="text" id="chat-input" class="chat-input" placeholder="Describe the issue..." 
+               onkeypress="if(event.key === 'Enter') sendChatMessage()">
+        <button id="chat-send-btn" class="chat-send-btn" onclick="sendChatMessage()">
+          <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+      </div>
+    </div>
+    
+    <script>
+      // Error capture storage
+      let capturedErrors = [];
+      let errorScreenshot = null;  // Store screenshot captured at error time
+      
+      // Function to capture screenshot immediately when error occurs (global)
+      window.captureErrorScreenshot = async function() {
+        try {
+          if (typeof html2canvas === 'undefined') return;
+          
+          const canvas = await html2canvas(document.body, {
+            scale: 0.8,
+            logging: false,
+            useCORS: true
+          });
+          
+          errorScreenshot = canvas.toDataURL('image/png');
+          console.log('Error screenshot captured');
+        } catch (e) {
+          // Silently fail - screenshot is optional
+        }
+      }
+      
+      // Capture console errors
+      const originalConsoleError = console.error;
+      console.error = function(...args) {
+        capturedErrors.push({
+          type: 'console.error',
+          message: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '),
+          timestamp: new Date().toISOString(),
+          url: window.location.pathname
+        });
+        updateErrorBadge();
+        // Capture screenshot when error occurs
+        if (!errorScreenshot) {
+          captureErrorScreenshot();
+        }
+        originalConsoleError.apply(console, args);
+      };
+      
+      // Capture unhandled errors
+      window.onerror = function(message, source, lineno, colno, error) {
+        capturedErrors.push({
+          type: 'window.onerror',
+          message: message,
+          source: source,
+          line: lineno,
+          column: colno,
+          timestamp: new Date().toISOString(),
+          url: window.location.pathname
+        });
+        updateErrorBadge();
+        // Capture screenshot when error occurs
+        if (!errorScreenshot) {
+          captureErrorScreenshot();
+        }
+      };
+      
+      // Capture unhandled promise rejections
+      window.onunhandledrejection = function(event) {
+        capturedErrors.push({
+          type: 'unhandledrejection',
+          message: event.reason?.message || String(event.reason),
+          timestamp: new Date().toISOString(),
+          url: window.location.pathname
+        });
+        updateErrorBadge();
+        // Capture screenshot when error occurs
+        if (!errorScreenshot) {
+          captureErrorScreenshot();
+        }
+      };
+      
+      function updateErrorBadge() {
+        const badge = document.getElementById('error-badge');
+        if (capturedErrors.length > 0) {
+          badge.style.display = 'block';
+          badge.textContent = capturedErrors.length;
+        } else {
+          badge.style.display = 'none';
+        }
+      }
+      
+      function toggleChatPanel() {
+        const panel = document.getElementById('chat-panel');
+        panel.classList.toggle('open');
+        if (panel.classList.contains('open')) {
+          document.getElementById('chat-input').focus();
+        }
+      }
+      
+      function addChatMessage(content, type = 'assistant') {
+        const messagesDiv = document.getElementById('chat-messages');
+        const messageDiv = document.createElement('div');
+        messageDiv.className = `chat-message ${type}`;
+        messageDiv.innerHTML = content;
+        messagesDiv.appendChild(messageDiv);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      }
+      
+      function showTypingIndicator() {
+        const messagesDiv = document.getElementById('chat-messages');
+        const typingDiv = document.createElement('div');
+        typingDiv.id = 'typing-indicator';
+        typingDiv.className = 'chat-typing';
+        typingDiv.innerHTML = '<span></span><span></span><span></span>';
+        messagesDiv.appendChild(typingDiv);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      }
+      
+      function hideTypingIndicator() {
+        const typingDiv = document.getElementById('typing-indicator');
+        if (typingDiv) typingDiv.remove();
+      }
+      
+      async function captureScreenshot() {
+        try {
+          // Hide the chat panel temporarily for clean screenshot
+          const chatPanel = document.getElementById('chat-panel');
+          const chatBtn = document.getElementById('chat-assistant-btn');
+          const originalPanelDisplay = chatPanel.style.display;
+          const originalBtnDisplay = chatBtn.style.display;
+          
+          chatPanel.style.display = 'none';
+          chatBtn.style.display = 'none';
+          
+          const canvas = await html2canvas(document.body, {
+            scale: 0.8,
+            logging: false,
+            useCORS: true
+          });
+          
+          // Restore chat panel
+          chatPanel.style.display = originalPanelDisplay;
+          chatBtn.style.display = originalBtnDisplay;
+          
+          return canvas.toDataURL('image/png');
+        } catch (e) {
+          console.error('Screenshot capture failed:', e);
+          return null;
+        }
+      }
+      
+      async function sendChatMessage() {
+        const input = document.getElementById('chat-input');
+        const sendBtn = document.getElementById('chat-send-btn');
+        const message = input.value.trim();
+        
+        if (!message) return;
+        
+        // Add user message to chat
+        addChatMessage(message, 'user');
+        input.value = '';
+        sendBtn.disabled = true;
+        
+        // Show typing indicator
+        showTypingIndicator();
+        
+        try {
+          // Use the screenshot captured at error time, or capture now if none exists
+          let screenshot = errorScreenshot;
+          if (!screenshot) {
+            addChatMessage('📸 Capturing screenshot...', 'assistant');
+            screenshot = await captureScreenshot();
+            
+            // Remove the "capturing" message
+            const messages = document.getElementById('chat-messages');
+            const lastMsg = messages.lastElementChild;
+            if (lastMsg && lastMsg.textContent.includes('Capturing')) {
+              lastMsg.remove();
+            }
+          }
+          
+          const response = await fetch('/chat-assistant', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              message: message,
+              page_url: window.location.pathname,
+              page_title: document.title,
+              captured_errors: capturedErrors,
+              screenshot: screenshot
+            })
+          });
+          
+          const data = await response.json();
+          hideTypingIndicator();
+          
+          if (data.success) {
+            if (data.jira_key) {
+              let successMsg = `✅ <strong>Issue created!</strong><br>` +
+                `<strong>${data.jira_key}</strong>: ${data.summary}<br>`;
+              
+              // Show what was attached
+              if (data.screenshot_attached) {
+                successMsg += `📸 Screenshot attached<br>`;
+              }
+              if (data.logs_attached) {
+                successMsg += `📋 Error logs attached<br>`;
+              }
+              if (data.suggested_owner) {
+                successMsg += `👤 <strong>Suggested owner:</strong> ${data.suggested_owner}<br>`;
+              }
+              
+              successMsg += `<a href="${data.jira_url}" target="_blank">Open in JIRA →</a>`;
+              
+              addChatMessage(successMsg, 'success');
+              
+              // Clear captured errors and screenshot after successful report
+              capturedErrors = [];
+              errorScreenshot = null;
+              updateErrorBadge();
+            } else {
+              addChatMessage(data.response, 'assistant');
+            }
+          } else {
+            addChatMessage(`❌ ${data.error || 'Something went wrong'}`, 'error');
+          }
+        } catch (err) {
+          hideTypingIndicator();
+          addChatMessage(`❌ Error: ${err.message}`, 'error');
+        }
+        
+        sendBtn.disabled = false;
+      }
+    </script>
+    {% endif %}
+    
+    <!-- html2canvas for screenshot capture -->
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    
     <!-- Bootstrap JS Bundle (required for modals, dropdowns, etc.) -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
   </body>
