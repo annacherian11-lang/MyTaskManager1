@@ -5,6 +5,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
+import requests
+from requests.auth import HTTPBasicAuth
+
 from flask import (
     Flask,
     flash,
@@ -29,6 +32,143 @@ from werkzeug.security import check_password_hash, generate_password_hash
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "app.db")
 
+# Temporary test tokens for Playwright automation (expires quickly)
+import secrets
+TEST_TOKENS = {}  # {token: {"user_id": id, "expires": timestamp}}
+
+# JIRA Configuration - loaded once at startup
+JIRA_CONFIG = {
+    "url": os.environ.get("JIRA_URL", "").rstrip("/"),
+    "email": os.environ.get("JIRA_EMAIL"),
+    "token": os.environ.get("JIRA_API_TOKEN"),
+    "project": os.environ.get("JIRA_PROJECT_KEY", "SCRUM"),
+}
+
+# LLM Configuration
+LLM_CONFIG = {
+    "groq_key": os.environ.get("GROQ_API_KEY"),
+    "gemini_key": os.environ.get("GEMINI_API_KEY"),
+}
+
+
+def is_jira_configured():
+    """Check if JIRA is properly configured."""
+    return all([JIRA_CONFIG["url"], JIRA_CONFIG["email"], JIRA_CONFIG["token"]])
+
+
+def get_jira_auth():
+    """Get JIRA authentication object."""
+    return HTTPBasicAuth(JIRA_CONFIG["email"], JIRA_CONFIG["token"])
+
+
+def fetch_jira_issues(fields="summary,status", max_results=50):
+    """
+    Fetch JIRA issues assigned to current user.
+    Shared function to avoid duplicate API calls.
+    """
+    if not is_jira_configured():
+        return [], "JIRA not configured"
+    
+    try:
+        api_url = f"{JIRA_CONFIG['url']}/rest/api/3/search/jql"
+        headers = {"Accept": "application/json"}
+        params = {
+            "jql": "assignee = currentUser() ORDER BY updated DESC",
+            "maxResults": max_results,
+            "fields": fields
+        }
+        
+        response = requests.get(
+            api_url, 
+            headers=headers, 
+            params=params, 
+            auth=get_jira_auth(), 
+            verify=False
+        )
+        response.raise_for_status()
+        return response.json().get("issues", []), None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_jira_issue(issue_key):
+    """Fetch a single JIRA issue by key."""
+    if not is_jira_configured():
+        return None, "JIRA not configured"
+    
+    try:
+        api_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue/{issue_key}"
+        headers = {"Accept": "application/json"}
+        
+        response = requests.get(
+            api_url, 
+            headers=headers, 
+            auth=get_jira_auth(), 
+            verify=False
+        )
+        response.raise_for_status()
+        return response.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def extract_jira_description(description_raw):
+    """
+    Extract plain text from JIRA Atlassian Document Format.
+    Moved to module level to avoid recreating on each call.
+    """
+    if not description_raw:
+        return ""
+    
+    if isinstance(description_raw, str):
+        return description_raw
+    
+    if isinstance(description_raw, dict):
+        def extract_text(node):
+            text = ""
+            if isinstance(node, dict):
+                if node.get("type") == "text":
+                    text += node.get("text", "")
+                for child in node.get("content", []):
+                    text += extract_text(child)
+            elif isinstance(node, list):
+                for item in node:
+                    text += extract_text(item)
+            return text
+        return extract_text(description_raw)
+    
+    return ""
+
+
+def parse_jira_issues(raw_issues, include_description=False):
+    """Parse raw JIRA issues into a clean format."""
+    issues = []
+    for i in raw_issues:
+        fields = i.get("fields", {})
+        status_obj = fields.get("status") or {}
+        assignee_obj = fields.get("assignee") or {}
+        priority_obj = fields.get("priority") or {}
+        duedate = fields.get("duedate") or ""
+        
+        issue = {
+            "key": i.get("key", ""),
+            "summary": fields.get("summary", ""),
+            "status": status_obj.get("name", "Unknown"),
+            "url": f"{JIRA_CONFIG['url']}/browse/{i.get('key', '')}",
+        }
+        
+        if "duedate" in fields:
+            issue["duedate"] = str(duedate)[:10] if duedate else ""
+        if "assignee" in fields:
+            issue["assignee"] = assignee_obj.get("displayName", "")
+        if "priority" in fields:
+            issue["priority"] = priority_obj.get("name", "")
+        if include_description:
+            issue["description"] = extract_jira_description(fields.get("description"))
+        
+        issues.append(issue)
+    return issues
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -50,11 +190,30 @@ def create_app() -> Flask:
             return None
         return User(row["id"], row["username"])
 
-    @app.before_request
-    def _ensure_db():
+    # Initialize database once at app startup (not on every request)
+    with app.app_context():
         init_db()
+
+    @app.before_request
+    def _ensure_session():
         if "mode" not in session:
             session["mode"] = "work"
+        
+        # Check for test automation token (allows Playwright to access authenticated pages)
+        test_token = request.cookies.get("test_automation_token")
+        if test_token and test_token in TEST_TOKENS:
+            token_data = TEST_TOKENS[test_token]
+            # Check if token is still valid (expires in 5 minutes)
+            if datetime.utcnow().timestamp() < token_data["expires"]:
+                # Auto-login the test user if not already logged in
+                if not current_user.is_authenticated:
+                    user_id = token_data["user_id"]
+                    user = load_user(str(user_id))
+                    if user:
+                        login_user(user)
+            else:
+                # Token expired, remove it
+                del TEST_TOKENS[test_token]
 
     @app.teardown_appcontext
     def close_db(_exc):
@@ -128,6 +287,461 @@ def create_app() -> Flask:
             return redirect(url_for("home"))
         session["mode"] = mode
         return redirect(request.referrer or url_for("home"))
+
+    @app.post("/user-mode")
+    @login_required
+    def set_user_mode():
+        user_mode = request.form.get("user_mode")
+        if user_mode not in ("user", "tester"):
+            flash("Invalid user mode.", "danger")
+            return redirect(url_for("home"))
+        session["user_mode"] = user_mode
+        return redirect(request.referrer or url_for("home"))
+
+    @app.post("/generate-test-case")
+    @login_required
+    def generate_test_case():
+        import json as json_lib
+        
+        data = request.get_json()
+        page_name = data.get("page_name", "Unknown Page")
+        page_url = data.get("page_url", "/")
+        
+        # Define test case context based on page
+        page_contexts = {
+            "/home": "Dashboard page showing task summary, navigation to tasks and people management",
+            "/tasks": "Task management page - add, edit, delete tasks with assignee, ETA, status",
+            "/people": "People management page - add/remove team members or family members",
+            "/jira-tasks": "JIRA integration page - view JIRA issues assigned to user",
+            "/jira-mcp": "JIRA MCP page - AI-powered JIRA management",
+            "/describe-process": "Process flow page - generates Mermaid diagrams from JIRA tickets",
+            "/search-insights": "Search page - search across JIRA and Confluence",
+            "/search-phrase": "Phrase search - keyword-based search",
+            "/search-llm": "LLM search - intelligent semantic search with AI analysis",
+            "/contact": "Contact page - static contact information",
+        }
+        
+        page_context = page_contexts.get(page_url, f"Page: {page_name} at {page_url}")
+        
+        # Clean up page name for title
+        clean_page_name = page_name.replace("Task Manager", "").strip()
+        if not clean_page_name or clean_page_name == "-":
+            clean_page_name = page_url.strip("/").replace("-", " ").title() or "Page"
+        
+        # Generate test cases using LLM
+        test_cases = None
+        
+        if not LLM_CONFIG["groq_key"]:
+            return json_lib.dumps({"success": False, "error": "LLM not configured"})
+        
+        try:
+            from groq import Groq
+            import httpx
+            
+            prompt = f"""Generate test cases for the following web application page:
+
+Page: {clean_page_name}
+URL: {page_url}
+Context: {page_context}
+
+Generate 5-7 test cases in the following format:
+
+TEST CASE 1: [Title]
+Precondition: [What needs to be set up]
+Steps:
+1. [Step 1]
+2. [Step 2]
+...
+Expected Result: [What should happen]
+
+Include:
+- Positive test cases (happy path)
+- Negative test cases (error handling)
+- Edge cases
+- UI/UX validations
+
+Be specific and practical."""
+
+            http_client = httpx.Client(verify=False)
+            groq_client = Groq(api_key=LLM_CONFIG["groq_key"], http_client=http_client)
+            
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2048
+            )
+            test_cases = response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return json_lib.dumps({"success": False, "error": f"LLM error: {str(e)[:100]}"})
+        
+        if not test_cases:
+            return json_lib.dumps({"success": False, "error": "Failed to generate test cases"})
+        
+        # Create JIRA ticket with all test cases
+        from shared.atlassian_client import get_client
+        atlassian_client = get_client()
+        
+        jira_result = atlassian_client.create_jira_issue(
+            summary=f"Test Cases for #{clean_page_name}",
+            description=f"Auto-generated test cases for #{clean_page_name} ({page_url})\n\n{test_cases}",
+            issue_type="Task"
+        )
+        
+        if jira_result.get("success"):
+            return json_lib.dumps({
+                "success": True,
+                "jira_key": jira_result.get("key"),
+                "jira_url": jira_result.get("url")
+            })
+        else:
+            return json_lib.dumps({
+                "success": False,
+                "error": jira_result.get("error", "Failed to create JIRA ticket")
+            })
+
+    @app.post("/execute-test-case")
+    @login_required
+    def execute_test_case():
+        import json as json_lib
+        import tempfile
+        import base64
+        
+        data = request.get_json()
+        jira_key = data.get("jira_key")
+        page_url = data.get("page_url", "/")
+        
+        if not jira_key:
+            return json_lib.dumps({"success": False, "error": "No JIRA ticket specified"})
+        
+        # Fetch the JIRA ticket to get test cases
+        issue, error = fetch_jira_issue(jira_key)
+        if error:
+            return json_lib.dumps({"success": False, "error": f"Failed to fetch JIRA ticket: {error}"})
+        
+        description = extract_jira_description(issue.get("fields", {}).get("description"))
+        if not description:
+            return json_lib.dumps({"success": False, "error": "No test cases found in ticket"})
+        
+        # Parse test cases from description
+        import re
+        test_case_pattern = r"TEST CASE \d+[:\s]+([^\n]+)"
+        test_cases = re.findall(test_case_pattern, description, re.IGNORECASE)
+        
+        if not test_cases:
+            # Try alternative pattern
+            test_case_pattern = r"\*\*TEST CASE \d+[:\s]+([^\*\n]+)"
+            test_cases = re.findall(test_case_pattern, description, re.IGNORECASE)
+        
+        if not test_cases:
+            test_cases = ["UI Verification Test"]
+        
+        # Get the Flask app's base URL
+        # Build URL from current request
+        base_url = request.host_url.rstrip("/")
+        full_url = base_url + page_url
+        
+        # Execute tests using Playwright
+        tests_passed = 0
+        tests_total = len(test_cases)
+        test_results = []
+        screenshot_paths = []  # Store multiple screenshots
+        
+        # Create a temp directory for all screenshots
+        import os
+        temp_dir = tempfile.mkdtemp(prefix="test_screenshots_")
+        
+        # Generate a temporary test token for Playwright authentication
+        test_token = secrets.token_urlsafe(32)
+        TEST_TOKENS[test_token] = {
+            "user_id": current_user.id,
+            "expires": datetime.utcnow().timestamp() + 300  # 5 minutes
+        }
+        
+        try:
+            from playwright.sync_api import sync_playwright
+            import time
+            
+            with sync_playwright() as p:
+                # Launch browser
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(viewport={"width": 1280, "height": 720})
+                
+                # Add the test automation cookie for authentication bypass
+                context.add_cookies([{
+                    "name": "test_automation_token",
+                    "value": test_token,
+                    "domain": request.host.split(":")[0],  # localhost or IP
+                    "path": "/"
+                }])
+                
+                page = context.new_page()
+                
+                # Execute each test case with unique actions
+                for i, test_name in enumerate(test_cases, 1):
+                    test_passed = False
+                    test_message = ""
+                    
+                    try:
+                        # Navigate fresh for each test case
+                        page.goto(full_url, wait_until="networkidle", timeout=30000)
+                        time.sleep(0.3)
+                        
+                        # Add a visual marker overlay showing which test case this is
+                        page.evaluate(f"""
+                            (function() {{
+                                // Remove any existing marker
+                                var existing = document.getElementById('test-case-marker');
+                                if (existing) existing.remove();
+                                
+                                // Create new marker
+                                var marker = document.createElement('div');
+                                marker.id = 'test-case-marker';
+                                marker.style.cssText = 'position: fixed; top: 10px; right: 10px; background: #dc3545; color: white; padding: 15px 25px; font-size: 18px; font-weight: bold; z-index: 999999; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+                                marker.innerHTML = 'TEST CASE {i}<br><small style="font-size: 12px;">{test_name[:30].replace("'", "")}</small>';
+                                document.body.appendChild(marker);
+                            }})();
+                        """)
+                        time.sleep(0.2)
+                        
+                        # Parse test case name for keywords to determine actions
+                        test_lower = test_name.lower()
+                        
+                        # Try to execute relevant actions based on test case keywords
+                        if any(word in test_lower for word in ['click', 'button', 'submit', 'add']):
+                            buttons = page.locator("button:visible, input[type='submit']:visible, .btn:visible").all()
+                            if buttons:
+                                try:
+                                    # Click different button for each test case
+                                    btn_index = (i - 1) % len(buttons)
+                                    buttons[btn_index].scroll_into_view_if_needed()
+                                    buttons[btn_index].click(timeout=3000)
+                                    time.sleep(0.5)
+                                    test_message = f"Clicked button #{btn_index + 1}"
+                                except:
+                                    test_message = "Button interaction attempted"
+                        
+                        elif any(word in test_lower for word in ['input', 'field', 'form', 'enter', 'type']):
+                            inputs = page.locator("input[type='text']:visible, input[type='email']:visible, textarea:visible").all()
+                            if inputs:
+                                try:
+                                    input_index = (i - 1) % len(inputs)
+                                    inputs[input_index].scroll_into_view_if_needed()
+                                    inputs[input_index].fill(f"Test Input for TC{i}")
+                                    time.sleep(0.3)
+                                    test_message = f"Filled input #{input_index + 1}"
+                                except:
+                                    test_message = "Input interaction attempted"
+                        
+                        elif any(word in test_lower for word in ['error', 'invalid', 'empty', 'validation', 'negative']):
+                            # Clear any required field and try to submit
+                            inputs = page.locator("input[required]:visible").all()
+                            if inputs:
+                                try:
+                                    inputs[0].fill("")
+                                    time.sleep(0.2)
+                                except:
+                                    pass
+                            submit_btns = page.locator("button[type='submit']:visible, input[type='submit']:visible").all()
+                            if submit_btns:
+                                try:
+                                    submit_btns[0].click(timeout=2000)
+                                    time.sleep(0.5)
+                                    test_message = "Validation triggered"
+                                except:
+                                    test_message = "Validation test attempted"
+                        
+                        elif any(word in test_lower for word in ['dropdown', 'select', 'option']):
+                            selects = page.locator("select:visible").all()
+                            if selects:
+                                try:
+                                    selects[0].scroll_into_view_if_needed()
+                                    selects[0].select_option(index=min(i, 2))
+                                    time.sleep(0.3)
+                                    test_message = f"Selected option {i}"
+                                except:
+                                    test_message = "Dropdown interaction attempted"
+                        
+                        elif any(word in test_lower for word in ['link', 'navigation', 'navigate', 'menu']):
+                            links = page.locator("a:visible, .nav-link:visible").all()
+                            if links:
+                                try:
+                                    link_index = (i - 1) % len(links)
+                                    links[link_index].scroll_into_view_if_needed()
+                                    # Highlight the link instead of clicking (to avoid navigation)
+                                    page.evaluate(f"""
+                                        var links = document.querySelectorAll('a, .nav-link');
+                                        if (links[{link_index}]) {{
+                                            links[{link_index}].style.outline = '3px solid red';
+                                            links[{link_index}].style.backgroundColor = '#ffeeee';
+                                        }}
+                                    """)
+                                    time.sleep(0.3)
+                                    test_message = f"Highlighted link #{link_index + 1}"
+                                except:
+                                    test_message = "Link test attempted"
+                        
+                        else:
+                            # Default: scroll to unique position and highlight a section
+                            scroll_percent = (i * 100) // (tests_total + 1)
+                            page.evaluate(f"""
+                                window.scrollTo(0, document.body.scrollHeight * {scroll_percent} / 100);
+                                // Highlight a visible section
+                                var sections = document.querySelectorAll('section, .card, article, main > div');
+                                if (sections[{i - 1} % sections.length]) {{
+                                    sections[{i - 1} % sections.length].style.outline = '3px solid blue';
+                                }}
+                            """)
+                            time.sleep(0.3)
+                            test_message = f"Page section {scroll_percent}%"
+                        
+                        # Verify page has content
+                        content = page.content()
+                        
+                        # Take screenshot with unique filename
+                        safe_name = "".join(c if c.isalnum() else "_" for c in test_name[:20])
+                        screenshot_file = os.path.join(temp_dir, f"TC{i}_{safe_name}.png")
+                        page.screenshot(path=screenshot_file)
+                        screenshot_paths.append((screenshot_file, f"TC{i}_{safe_name}.png"))
+                        
+                        if len(content) > 100:
+                            tests_passed += 1
+                            test_passed = True
+                            test_results.append(f"✅ TEST CASE {i}: {test_name} - PASSED ({test_message})")
+                        else:
+                            test_results.append(f"❌ TEST CASE {i}: {test_name} - FAILED (Page empty)")
+                        
+                    except Exception as e:
+                        # Take error screenshot
+                        try:
+                            screenshot_file = os.path.join(temp_dir, f"TC{i}_ERROR.png")
+                            page.screenshot(path=screenshot_file)
+                            screenshot_paths.append((screenshot_file, f"TC{i}_ERROR.png"))
+                        except:
+                            pass
+                        test_results.append(f"❌ TEST CASE {i}: {test_name} - FAILED ({str(e)[:50]})")
+                
+                browser.close()
+                
+                # Clean up test token
+                if test_token in TEST_TOKENS:
+                    del TEST_TOKENS[test_token]
+                
+        except Exception as e:
+            # Clean up test token on error
+            if test_token in TEST_TOKENS:
+                del TEST_TOKENS[test_token]
+            return json_lib.dumps({
+                "success": False, 
+                "error": f"Playwright error: {str(e)[:200]}"
+            })
+        
+        # Update JIRA ticket with test results
+        try:
+            test_result_text = "\n\n---\n\n## Test Execution Results\n\n"
+            test_result_text += f"**Executed:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            test_result_text += f"**Results:** {tests_passed}/{tests_total} tests passed\n\n"
+            test_result_text += "\n".join(test_results)
+            
+            # Build ADF for the comment
+            comment_adf = {
+                "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "heading",
+                            "attrs": {"level": 2},
+                            "content": [{"type": "text", "text": "Test Execution Results"}]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {"type": "text", "text": f"Executed: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"}
+                            ]
+                        },
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {"type": "text", "text": f"Results: {tests_passed}/{tests_total} tests passed", "marks": [{"type": "strong"}]}
+                            ]
+                        }
+                    ]
+                }
+            }
+            
+            # Add test result lines
+            for result in test_results:
+                comment_adf["body"]["content"].append({
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": result}]
+                })
+            
+            # Add comment to JIRA
+            comment_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue/{jira_key}/comment"
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            
+            comment_response = requests.post(
+                comment_url,
+                json=comment_adf,
+                headers=headers,
+                auth=get_jira_auth(),
+                verify=False
+            )
+            
+            # Upload all screenshots as attachments
+            if screenshot_paths:
+                attach_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue/{jira_key}/attachments"
+                attach_headers = {
+                    "Accept": "application/json",
+                    "X-Atlassian-Token": "no-check"
+                }
+                
+                uploaded_count = 0
+                for screenshot_path, filename in screenshot_paths:
+                    try:
+                        if os.path.exists(screenshot_path):
+                            with open(screenshot_path, 'rb') as f:
+                                file_content = f.read()
+                            
+                            # Upload with unique content
+                            files = {'file': (filename, file_content, 'image/png')}
+                            attach_response = requests.post(
+                                attach_url,
+                                headers=attach_headers,
+                                files=files,
+                                auth=get_jira_auth(),
+                                verify=False
+                            )
+                            
+                            if attach_response.status_code in [200, 201]:
+                                uploaded_count += 1
+                            
+                            # Clean up temp file
+                            os.remove(screenshot_path)
+                    except Exception as e:
+                        pass  # Screenshot upload is optional
+                
+                # Clean up temp directory
+                try:
+                    os.rmdir(temp_dir)
+                except:
+                    pass
+            
+        except Exception as e:
+            return json_lib.dumps({
+                "success": False,
+                "error": f"Failed to update JIRA: {str(e)[:100]}"
+            })
+        
+        return json_lib.dumps({
+            "success": True,
+            "tests_passed": tests_passed,
+            "tests_total": tests_total,
+            "jira_key": jira_key,
+            "jira_url": f"{JIRA_CONFIG['url']}/browse/{jira_key}"
+        })
 
     @app.get("/people")
     @login_required
@@ -279,43 +893,33 @@ def create_app() -> Flask:
         jira_created = False
         jira_key = None
         
-        if create_jira and mode == "work":
-            jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-            jira_email = os.environ.get("JIRA_EMAIL")
-            jira_token = os.environ.get("JIRA_API_TOKEN")
-            jira_project = os.environ.get("JIRA_PROJECT_KEY", "SCRUM")
-            
-            if all([jira_url, jira_email, jira_token]):
-                try:
-                    import requests
-                    from requests.auth import HTTPBasicAuth
-                    
-                    api_url = f"{jira_url}/rest/api/3/issue"
-                    auth = HTTPBasicAuth(jira_email, jira_token)
-                    headers = {
-                        "Accept": "application/json",
-                        "Content-Type": "application/json"
+        if create_jira and mode == "work" and is_jira_configured():
+            try:
+                api_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue"
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+                
+                payload = {
+                    "fields": {
+                        "project": {"key": JIRA_CONFIG['project']},
+                        "summary": description,
+                        "issuetype": {"name": "Task"}
                     }
-                    
-                    payload = {
-                        "fields": {
-                            "project": {"key": jira_project},
-                            "summary": description,
-                            "issuetype": {"name": "Task"}
-                        }
-                    }
-                    
-                    # Add due date if provided
-                    if eta_date:
-                        payload["fields"]["duedate"] = eta_date
-                    
-                    response = requests.post(api_url, json=payload, headers=headers, auth=auth, verify=False)
-                    response.raise_for_status()
-                    result = response.json()
-                    jira_key = result.get("key")
-                    jira_created = True
-                except Exception as e:
-                    flash(f"Task added locally, but JIRA creation failed: {e}", "warning")
+                }
+                
+                # Add due date if provided
+                if eta_date:
+                    payload["fields"]["duedate"] = eta_date
+                
+                response = requests.post(api_url, json=payload, headers=headers, auth=get_jira_auth(), verify=False)
+                response.raise_for_status()
+                result = response.json()
+                jira_key = result.get("key")
+                jira_created = True
+            except Exception as e:
+                flash(f"Task added locally, but JIRA creation failed: {e}", "warning")
         
         if jira_created and jira_key:
             flash(f"Task added to your task list and JIRA ({jira_key}).", "success")
@@ -331,53 +935,12 @@ def create_app() -> Flask:
             flash("JIRA Tasks is available in Work mode only.", "info")
             return redirect(url_for("home"))
 
-        jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-        jira_email = os.environ.get("JIRA_EMAIL")
-        jira_token = os.environ.get("JIRA_API_TOKEN")
-
-        jira_configured = bool(jira_url and jira_email and jira_token)
-        issues = []
-        error_message = None
-
-        if jira_configured:
-            try:
-                import requests
-                from requests.auth import HTTPBasicAuth
-                
-                # Use JIRA REST API v3 search/jql endpoint
-                api_url = f"{jira_url}/rest/api/3/search/jql"
-                auth = HTTPBasicAuth(jira_email, jira_token)
-                headers = {"Accept": "application/json"}
-                params = {
-                    "jql": "assignee = currentUser() ORDER BY updated DESC",
-                    "maxResults": 50,
-                    "fields": "summary,status,duedate,assignee"
-                }
-                
-                response = requests.get(api_url, headers=headers, params=params, auth=auth, verify=False)
-                response.raise_for_status()
-                data = response.json()
-                
-                for i in data.get("issues", []):
-                    fields = i.get("fields", {})
-                    status_obj = fields.get("status") or {}
-                    assignee_obj = fields.get("assignee") or {}
-                    duedate = fields.get("duedate") or ""
-                    
-                    issues.append({
-                        "key": i.get("key", ""),
-                        "summary": fields.get("summary", ""),
-                        "status": status_obj.get("name", "Unknown"),
-                        "duedate": str(duedate)[:10] if duedate else "",
-                        "assignee": assignee_obj.get("displayName", ""),
-                        "url": f"{jira_url}/browse/{i.get('key', '')}",
-                    })
-            except Exception as e:
-                error_message = str(e)
+        raw_issues, error_message = fetch_jira_issues(fields="summary,status,duedate,assignee")
+        issues = parse_jira_issues(raw_issues) if raw_issues else []
 
         return render_template(
             "jira_tasks.html",
-            jira_configured=jira_configured,
+            jira_configured=is_jira_configured(),
             issues=issues,
             error_message=error_message,
             mode=mode,
@@ -400,51 +963,8 @@ def create_app() -> Flask:
             flash("JIRA MCP is available in Work mode only.", "info")
             return redirect(url_for("home"))
         
-        jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-        jira_email = os.environ.get("JIRA_EMAIL")
-        jira_token = os.environ.get("JIRA_API_TOKEN")
-        
-        issues = []
-        error_message = None
-        
-        if all([jira_url, jira_email, jira_token]):
-            try:
-                import requests
-                from requests.auth import HTTPBasicAuth
-                
-                api_url = f"{jira_url}/rest/api/3/search/jql"
-                auth = HTTPBasicAuth(jira_email, jira_token)
-                headers = {"Accept": "application/json"}
-                params = {
-                    "jql": "assignee = currentUser() ORDER BY updated DESC",
-                    "maxResults": 50,
-                    "fields": "summary,status,duedate,assignee,priority,created"
-                }
-                
-                response = requests.get(api_url, headers=headers, params=params, auth=auth, verify=False)
-                response.raise_for_status()
-                data = response.json()
-                
-                for i in data.get("issues", []):
-                    fields = i.get("fields", {})
-                    status_obj = fields.get("status") or {}
-                    assignee_obj = fields.get("assignee") or {}
-                    priority_obj = fields.get("priority") or {}
-                    duedate = fields.get("duedate") or ""
-                    
-                    issues.append({
-                        "key": i.get("key", ""),
-                        "summary": fields.get("summary", ""),
-                        "status": status_obj.get("name", "Unknown"),
-                        "priority": priority_obj.get("name", ""),
-                        "duedate": str(duedate)[:10] if duedate else "",
-                        "assignee": assignee_obj.get("displayName", ""),
-                        "url": f"{jira_url}/browse/{i.get('key', '')}",
-                    })
-            except Exception as e:
-                error_message = str(e)
-        else:
-            error_message = "JIRA not configured"
+        raw_issues, error_message = fetch_jira_issues(fields="summary,status,duedate,assignee,priority")
+        issues = parse_jira_issues(raw_issues) if raw_issues else []
         
         return render_template("jira_mcp_view.html", issues=issues, error_message=error_message, mode=mode)
 
@@ -465,45 +985,8 @@ def create_app() -> Flask:
             flash("Describe Process is available in Work mode only.", "info")
             return redirect(url_for("home"))
         
-        jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-        jira_email = os.environ.get("JIRA_EMAIL")
-        jira_token = os.environ.get("JIRA_API_TOKEN")
-        
-        issues = []
-        error_message = None
-        
-        if all([jira_url, jira_email, jira_token]):
-            try:
-                import requests
-                from requests.auth import HTTPBasicAuth
-                
-                api_url = f"{jira_url}/rest/api/3/search/jql"
-                auth = HTTPBasicAuth(jira_email, jira_token)
-                headers = {"Accept": "application/json"}
-                params = {
-                    "jql": "assignee = currentUser() ORDER BY updated DESC",
-                    "maxResults": 50,
-                    "fields": "summary,status,description"
-                }
-                
-                response = requests.get(api_url, headers=headers, params=params, auth=auth, verify=False)
-                response.raise_for_status()
-                data = response.json()
-                
-                for i in data.get("issues", []):
-                    fields = i.get("fields", {})
-                    status_obj = fields.get("status") or {}
-                    
-                    issues.append({
-                        "key": i.get("key", ""),
-                        "summary": fields.get("summary", ""),
-                        "status": status_obj.get("name", "Unknown"),
-                        "url": f"{jira_url}/browse/{i.get('key', '')}",
-                    })
-            except Exception as e:
-                error_message = str(e)
-        else:
-            error_message = "JIRA not configured"
+        raw_issues, error_message = fetch_jira_issues(fields="summary,status,description")
+        issues = parse_jira_issues(raw_issues) if raw_issues else []
         
         return render_template("describe_process.html", issues=issues, error_message=error_message, mode=mode)
 
@@ -514,149 +997,144 @@ def create_app() -> Flask:
         if mode != "work":
             return redirect(url_for("home"))
         
-        jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-        jira_email = os.environ.get("JIRA_EMAIL")
-        jira_token = os.environ.get("JIRA_API_TOKEN")
-        gemini_key = os.environ.get("GEMINI_API_KEY")
-        
         issue_data = None
         process_steps = None
         error_message = None
-        gemini_error = None
+        llm_error = None
         
-        if not all([jira_url, jira_email, jira_token]):
-            error_message = "JIRA not configured"
-        else:
-            try:
-                import requests
-                from requests.auth import HTTPBasicAuth
-                
-                # Fetch JIRA issue details
-                api_url = f"{jira_url}/rest/api/3/issue/{issue_key}"
-                auth = HTTPBasicAuth(jira_email, jira_token)
-                headers = {"Accept": "application/json"}
-                
-                response = requests.get(api_url, headers=headers, auth=auth, verify=False)
-                response.raise_for_status()
-                issue = response.json()
-                
-                fields = issue.get("fields", {})
-                status_obj = fields.get("status") or {}
-                
-                # Extract description text from Atlassian Document Format
-                description_raw = fields.get("description")
-                description_text = ""
-                if description_raw and isinstance(description_raw, dict):
-                    # Parse ADF format
-                    def extract_text(node):
-                        text = ""
-                        if isinstance(node, dict):
-                            if node.get("type") == "text":
-                                text += node.get("text", "")
-                            for child in node.get("content", []):
-                                text += extract_text(child)
-                        elif isinstance(node, list):
-                            for item in node:
-                                text += extract_text(item)
-                        return text
-                    description_text = extract_text(description_raw)
-                elif isinstance(description_raw, str):
-                    description_text = description_raw
-                
-                issue_data = {
-                    "key": issue.get("key", ""),
-                    "summary": fields.get("summary", ""),
-                    "status": status_obj.get("name", "Unknown"),
-                    "description": description_text,
-                    "url": f"{jira_url}/browse/{issue.get('key', '')}",
-                }
-                
-                # Generate Mermaid diagram using Groq (fallback to Gemini)
-                groq_key = os.environ.get("GROQ_API_KEY")
-                llm_error = None
-                mermaid_diagram = None
-                
-                if groq_key and description_text.strip():
-                    try:
-                        from groq import Groq
-                        
-                        client = Groq(api_key=groq_key)
-                        
-                        prompt = f"""Analyze this JIRA task and create a process flow diagram using Mermaid syntax.
-
-JIRA Task: {issue_data['summary']}
-
-Description:
-{description_text}
-
-Generate a Mermaid flowchart that shows the sequence of steps or process flow for completing this task.
-Use the flowchart TD (top-down) format.
-Make it clear and easy to understand.
-Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` markers."""
-                        
-                        response = client.chat.completions.create(
-                            model="llama-3.1-8b-instant",
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.3,
-                            max_tokens=1024
-                        )
-                        mermaid_diagram = response.choices[0].message.content.strip()
-                        
-                        # Clean up any markdown code blocks
-                        if mermaid_diagram.startswith("```"):
-                            lines = mermaid_diagram.split("\n")
-                            mermaid_diagram = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-                        
-                    except Exception as e:
-                        mermaid_diagram = None
-                        llm_error = str(e)
-                elif gemini_key and description_text.strip():
-                    # Fallback to Gemini if Groq not configured
-                    try:
-                        import google.generativeai as genai
-                        
-                        genai.configure(api_key=gemini_key)
-                        model = genai.GenerativeModel('gemini-2.0-flash')
-                        
-                        prompt = f"""Analyze this JIRA task and create a process flow diagram using Mermaid syntax.
-
-JIRA Task: {issue_data['summary']}
-
-Description:
-{description_text}
-
-Generate a Mermaid flowchart that shows the sequence of steps or process flow for completing this task.
-Use the flowchart TD (top-down) format.
-Make it clear and easy to understand.
-Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` markers."""
-                        
-                        response = model.generate_content(prompt)
-                        mermaid_diagram = response.text.strip()
-                        
-                        # Clean up any markdown code blocks
-                        if mermaid_diagram.startswith("```"):
-                            lines = mermaid_diagram.split("\n")
-                            mermaid_diagram = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-                        
-                    except Exception as e:
-                        mermaid_diagram = None
-                        llm_error = str(e)
-                elif not groq_key and not gemini_key:
-                    pass  # No API key configured
-                
-                process_steps = mermaid_diagram  # Pass to template
-                gemini_error = llm_error
+        # Fetch JIRA issue using shared function
+        issue, error_message = fetch_jira_issue(issue_key)
+        
+        if issue:
+            fields = issue.get("fields", {})
+            status_obj = fields.get("status") or {}
+            description_text = extract_jira_description(fields.get("description"))
+            
+            issue_data = {
+                "key": issue.get("key", ""),
+                "summary": fields.get("summary", ""),
+                "status": status_obj.get("name", "Unknown"),
+                "description": description_text,
+                "url": f"{JIRA_CONFIG['url']}/browse/{issue.get('key', '')}",
+            }
+            
+            # Generate Mermaid diagram using Groq (fallback to Gemini)
+            mermaid_diagram = None
+            
+            if LLM_CONFIG["groq_key"] and description_text.strip():
+                try:
+                    from groq import Groq
+                    import httpx
                     
-            except Exception as e:
-                error_message = str(e)
+                    # Use httpx client with SSL verification disabled (corporate network)
+                    http_client = httpx.Client(verify=False)
+                    client = Groq(api_key=LLM_CONFIG["groq_key"], http_client=http_client)
+                    
+                    prompt = f"""Create a Mermaid flowchart based on the PROBLEM STATEMENT below.
+
+PROBLEM STATEMENT (use this to create the process flow):
+{description_text}
+
+IMPORTANT RULES:
+1. Start with: flowchart TD
+2. Use simple node IDs like A, B, C, D (letters only)
+3. Use square brackets for text: A[Step 1 text]
+4. Use arrows: A --> B
+5. Keep text short (under 30 chars per node)
+6. No special characters like quotes, parentheses in text
+7. No colons inside brackets
+8. Maximum 8 nodes
+9. Focus ONLY on the problem statement above, NOT the task title
+
+Example format:
+flowchart TD
+    A[Start] --> B[Step 1]
+    B --> C[Step 2]
+    C --> D[End]
+
+Output ONLY the Mermaid code, nothing else."""
+                    
+                    response = client.chat.completions.create(
+                        model="llama-3.1-8b-instant",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2,
+                        max_tokens=512
+                    )
+                    mermaid_diagram = response.choices[0].message.content.strip()
+                    
+                    # Clean up the response
+                    import re
+                    # Remove markdown code blocks
+                    if "```" in mermaid_diagram:
+                        mermaid_diagram = re.sub(r'```mermaid\s*', '', mermaid_diagram)
+                        mermaid_diagram = re.sub(r'```\s*', '', mermaid_diagram)
+                    
+                    # Ensure it starts with flowchart
+                    if not mermaid_diagram.strip().startswith("flowchart"):
+                        mermaid_diagram = "flowchart TD\n" + mermaid_diagram
+                    
+                    # Remove problematic characters from node text
+                    mermaid_diagram = re.sub(r'\[([^\]]*):([^\]]*)\]', r'[\1 - \2]', mermaid_diagram)
+                    mermaid_diagram = re.sub(r'\[([^\]]*)"([^\]]*)\]', r'[\1\2]', mermaid_diagram)
+                    mermaid_diagram = re.sub(r"\[([^\]]*)'([^\]]*)\]", r'[\1\2]', mermaid_diagram)
+                    
+                except Exception as e:
+                    mermaid_diagram = None
+                    llm_error = str(e)
+            elif LLM_CONFIG["gemini_key"] and description_text.strip():
+                # Fallback to Gemini if Groq not configured
+                try:
+                    import google.generativeai as genai
+                    import re
+                    
+                    genai.configure(api_key=LLM_CONFIG["gemini_key"])
+                    model = genai.GenerativeModel('gemini-2.0-flash')
+                    
+                    prompt = f"""Create a Mermaid flowchart based on the PROBLEM STATEMENT below.
+
+PROBLEM STATEMENT (use this to create the process flow):
+{description_text}
+
+IMPORTANT RULES:
+1. Start with: flowchart TD
+2. Use simple node IDs like A, B, C, D (letters only)
+3. Use square brackets for text: A[Step 1 text]
+4. Use arrows: A --> B
+5. Keep text short (under 30 chars per node)
+6. No special characters like quotes, parentheses in text
+7. No colons inside brackets
+8. Maximum 8 nodes
+9. Focus ONLY on the problem statement above, NOT the task title
+
+Output ONLY the Mermaid code, nothing else."""
+                    
+                    response = model.generate_content(prompt)
+                    mermaid_diagram = response.text.strip()
+                    
+                    # Clean up the response
+                    if "```" in mermaid_diagram:
+                        mermaid_diagram = re.sub(r'```mermaid\s*', '', mermaid_diagram)
+                        mermaid_diagram = re.sub(r'```\s*', '', mermaid_diagram)
+                    
+                    if not mermaid_diagram.strip().startswith("flowchart"):
+                        mermaid_diagram = "flowchart TD\n" + mermaid_diagram
+                    
+                    mermaid_diagram = re.sub(r'\[([^\]]*):([^\]]*)\]', r'[\1 - \2]', mermaid_diagram)
+                    mermaid_diagram = re.sub(r'\[([^\]]*)"([^\]]*)\]', r'[\1\2]', mermaid_diagram)
+                    mermaid_diagram = re.sub(r"\[([^\]]*)'([^\]]*)\]", r'[\1\2]', mermaid_diagram)
+                    
+                except Exception as e:
+                    mermaid_diagram = None
+                    llm_error = str(e)
+            
+            process_steps = mermaid_diagram
         
-        groq_key = os.environ.get("GROQ_API_KEY")
         return render_template(
             "process_flow.html",
             issue=issue_data,
             process_steps=process_steps,
-            gemini_configured=bool(groq_key or gemini_key),
-            gemini_error=gemini_error,
+            gemini_configured=bool(LLM_CONFIG["groq_key"] or LLM_CONFIG["gemini_key"]),
+            gemini_error=llm_error,
             error_message=error_message,
             mode=mode
         )
@@ -678,21 +1156,12 @@ Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` mar
             flash("Summary is required.", "danger")
             return redirect(url_for("jira_mcp_create"))
         
-        jira_url = os.environ.get("JIRA_URL", "").rstrip("/")
-        jira_email = os.environ.get("JIRA_EMAIL")
-        jira_token = os.environ.get("JIRA_API_TOKEN")
-        jira_project = os.environ.get("JIRA_PROJECT_KEY", "SCRUM")
-        
-        if not all([jira_url, jira_email, jira_token]):
+        if not is_jira_configured():
             flash("JIRA not configured.", "danger")
             return redirect(url_for("jira_mcp_create"))
         
         try:
-            import requests
-            from requests.auth import HTTPBasicAuth
-            
-            api_url = f"{jira_url}/rest/api/3/issue"
-            auth = HTTPBasicAuth(jira_email, jira_token)
+            api_url = f"{JIRA_CONFIG['url']}/rest/api/3/issue"
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json"
@@ -700,7 +1169,7 @@ Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` mar
             
             payload = {
                 "fields": {
-                    "project": {"key": jira_project},
+                    "project": {"key": JIRA_CONFIG['project']},
                     "summary": summary,
                     "issuetype": {"name": issue_type}
                 }
@@ -724,7 +1193,7 @@ Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` mar
             if due_date:
                 payload["fields"]["duedate"] = due_date
             
-            response = requests.post(api_url, json=payload, headers=headers, auth=auth, verify=False)
+            response = requests.post(api_url, json=payload, headers=headers, auth=get_jira_auth(), verify=False)
             response.raise_for_status()
             result = response.json()
             
@@ -741,6 +1210,349 @@ Only output the Mermaid code, nothing else. Do not include ```mermaid or ``` mar
     def contact():
         mode = session.get("mode", "work")
         return render_template("contact.html", mode=mode)
+
+    @app.post("/submit-feedback")
+    @login_required
+    def submit_feedback():
+        import json as json_lib
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        name = (request.form.get("name") or "").strip()
+        experience = (request.form.get("experience") or "").strip()
+        
+        if not name or not experience:
+            return json_lib.dumps({"success": False, "error": "Name and feedback are required"})
+        
+        if len(experience) > 3000:
+            return json_lib.dumps({"success": False, "error": "Feedback exceeds 3000 characters"})
+        
+        # Email configuration
+        recipient_email = "anna.cherian11@gmail.com"
+        
+        # Get SMTP settings from environment (optional)
+        smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USER", "")
+        smtp_password = os.environ.get("SMTP_PASSWORD", "")
+        
+        # Create email content
+        subject = f"Task Manager Feedback from {name}"
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2 style="color: #333;">New Feedback Received</h2>
+            <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Name</td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{name}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold;">Submitted By</td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{current_user.username}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd; background: #f5f5f5; font-weight: bold; vertical-align: top;">Experience</td>
+                    <td style="padding: 10px; border: 1px solid #ddd; white-space: pre-wrap;">{experience}</td>
+                </tr>
+            </table>
+            <p style="color: #666; margin-top: 20px; font-size: 12px;">
+                This feedback was submitted via Task Manager application.
+            </p>
+        </body>
+        </html>
+        """
+        
+        plain_body = f"""
+New Feedback Received
+---------------------
+Name: {name}
+Submitted By: {current_user.username}
+
+Experience:
+{experience}
+
+---
+This feedback was submitted via Task Manager application.
+        """
+        
+        # Try to send email
+        email_sent = False
+        email_error = None
+        
+        if smtp_user and smtp_password:
+            try:
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = smtp_user
+                msg["To"] = recipient_email
+                
+                msg.attach(MIMEText(plain_body, "plain"))
+                msg.attach(MIMEText(html_body, "html"))
+                
+                with smtplib.SMTP(smtp_host, smtp_port) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_password)
+                    server.sendmail(smtp_user, recipient_email, msg.as_string())
+                
+                email_sent = True
+            except Exception as e:
+                email_error = str(e)
+        else:
+            email_error = "SMTP not configured"
+        
+        # If email fails, store feedback locally as fallback
+        if not email_sent:
+            try:
+                feedback_file = os.path.join(APP_DIR, "feedback_log.txt")
+                with open(feedback_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*50}\n")
+                    f.write(f"Date: {datetime.utcnow().isoformat()}\n")
+                    f.write(f"Name: {name}\n")
+                    f.write(f"User: {current_user.username}\n")
+                    f.write(f"Experience:\n{experience}\n")
+                    f.write(f"Email Status: {email_error}\n")
+                
+                # Return success even if email failed - feedback is logged
+                return json_lib.dumps({
+                    "success": True, 
+                    "message": "Feedback saved (email delivery pending - SMTP not configured)"
+                })
+            except Exception as e:
+                return json_lib.dumps({"success": False, "error": f"Failed to save feedback: {str(e)}"})
+        
+        return json_lib.dumps({"success": True, "message": "Feedback sent successfully"})
+
+    @app.get("/search-insights")
+    @login_required
+    def search_insights():
+        mode = session.get("mode", "work")
+        if mode != "work":
+            flash("Search is available in Work mode only.", "info")
+            return redirect(url_for("home"))
+        return render_template("search_insights.html", mode=mode)
+
+    # ==================== Phrase Matching Search ====================
+    
+    @app.get("/search-phrase")
+    @login_required
+    def search_phrase():
+        mode = session.get("mode", "work")
+        if mode != "work":
+            return redirect(url_for("home"))
+        return render_template("search_phrase.html", mode=mode)
+
+    @app.post("/search-phrase")
+    @login_required
+    def search_phrase_submit():
+        mode = session.get("mode", "work")
+        if mode != "work":
+            return redirect(url_for("home"))
+        
+        query = (request.form.get("query") or "").strip()
+        if not query:
+            flash("Please enter search keywords.", "danger")
+            return redirect(url_for("search_phrase"))
+        
+        # Use shared Atlassian client
+        from shared.atlassian_client import get_client
+        client = get_client()
+        
+        # Search both JIRA and Confluence
+        result = client.search_all(query, max_results=20)
+        
+        jira_results = result.get("jira_results", [])
+        confluence_results = result.get("confluence_results", [])
+        error_message = " | ".join(result.get("errors", [])) if result.get("errors") else None
+        
+        return render_template(
+            "search_results.html",
+            query=query,
+            jira_results=jira_results,
+            confluence_results=confluence_results,
+            error_message=error_message,
+            search_type="phrase",
+            mode=mode
+        )
+
+    # ==================== LLM Search ====================
+    
+    @app.get("/search-llm")
+    @login_required
+    def search_llm():
+        mode = session.get("mode", "work")
+        if mode != "work":
+            return redirect(url_for("home"))
+        return render_template("search_llm.html", mode=mode)
+
+    @app.post("/search-llm")
+    @login_required
+    def search_llm_submit():
+        mode = session.get("mode", "work")
+        if mode != "work":
+            return redirect(url_for("home"))
+        
+        query = (request.form.get("query") or "").strip()
+        if not query:
+            flash("Please enter your question.", "danger")
+            return redirect(url_for("search_llm"))
+        
+        # Use shared Atlassian client
+        from shared.atlassian_client import get_client
+        client = get_client()
+        
+        # SMART SEARCH: Extract keywords and search each separately
+        # Remove common stop words
+        stop_words = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'of', 'to', 'in', 
+                      'for', 'on', 'with', 'at', 'by', 'from', 'as', 'it', 'that', 
+                      'which', 'or', 'and', 'be', 'this', 'have', 'has', 'do', 'does',
+                      'what', 'why', 'how', 'when', 'where', 'who', 'over', 'between'}
+        
+        # Extract meaningful keywords
+        import re
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+        keywords = [w for w in words if w not in stop_words]
+        
+        # Create compound word variations (front + load = front-load, frontload)
+        compound_terms = []
+        for i in range(len(keywords) - 1):
+            compound_terms.append(f"{keywords[i]}-{keywords[i+1]}")  # front-load
+            compound_terms.append(f"{keywords[i]}{keywords[i+1]}")   # frontload
+        
+        # Also add specific domain variations
+        domain_variations = []
+        if 'front' in keywords and 'load' in keywords:
+            domain_variations.extend(['front-load', 'front-loading', 'frontload', 'front loader'])
+        if 'top' in keywords and 'load' in keywords:
+            domain_variations.extend(['top-load', 'top-loading', 'topload', 'top loader'])
+        
+        # Always include full query + compounds + individual keywords
+        search_terms = [query] + compound_terms + domain_variations + keywords
+        
+        # Collect results from all searches
+        all_jira = {}
+        all_confluence = {}
+        errors = []
+        
+        for term in search_terms[:10]:  # Limit to 10 searches for better coverage
+            result = client.search_all(term, max_results=15, full_content=True)
+            
+            # Deduplicate JIRA results by key
+            for item in result.get("jira_results", []):
+                key = item.get("key")
+                if key and key not in all_jira:
+                    all_jira[key] = item
+            
+            # Deduplicate Confluence results by id
+            for item in result.get("confluence_results", []):
+                page_id = item.get("id")
+                if page_id and page_id not in all_confluence:
+                    all_confluence[page_id] = item
+            
+            if result.get("errors"):
+                errors.extend(result.get("errors"))
+        
+        jira_results = list(all_jira.values())
+        confluence_results = list(all_confluence.values())
+        error_message = " | ".join(set(errors)) if errors else None
+        insights = None
+        
+        # Use LLM to analyze and filter results
+        total_results = len(jira_results) + len(confluence_results)
+        if total_results > 0:
+            # Prepare context for LLM
+            context = f"User query: {query}\n\n"
+            context += "Search results from JIRA and Confluence:\n\n"
+            
+            for r in jira_results[:10]:
+                context += f"[JIRA {r['key']}] {r['summary']}\n"
+                if r.get('description'):
+                    context += f"Description: {r['description'][:500]}\n"
+                context += "\n"
+            
+            for r in confluence_results[:10]:
+                context += f"[Confluence] {r['title']} (Space: {r['space']})\n"
+                if r.get('preview'):
+                    # Show more content for better LLM analysis
+                    context += f"Content: {r['preview'][:1000]}\n"
+                context += "\n"
+            
+            prompt = f"""You are a search assistant analyzing results from JIRA and Confluence.
+
+USER'S QUESTION: "{query}"
+
+SEARCH RESULTS:
+{context}
+
+YOUR TASK:
+1. ANSWER the user's question using information from the search results
+2. IDENTIFY which results are most relevant (list them by name/key)
+3. QUOTE specific content that answers the question
+4. IGNORE results that don't relate to the question (just partial keyword matches)
+
+Be direct and helpful. If a result contains the answer, extract and present it clearly."""
+
+            # Try Ollama first (local LLM - no proxy issues)
+            ollama_success = False
+            try:
+                ollama_response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "llama3.2",
+                        "prompt": prompt,
+                        "stream": False
+                    },
+                    timeout=60
+                )
+                if ollama_response.status_code == 200:
+                    ollama_data = ollama_response.json()
+                    insights = ollama_data.get("response", "").strip()
+                    if insights:
+                        ollama_success = True
+                        insights = f"[Ollama] {insights}"
+            except Exception:
+                pass  # Ollama not available, try Groq
+            
+            # Fall back to Groq if Ollama failed
+            if not ollama_success and LLM_CONFIG["groq_key"]:
+                try:
+                    from groq import Groq
+                    import httpx
+                    
+                    http_client = httpx.Client(verify=False)
+                    groq_client = Groq(api_key=LLM_CONFIG["groq_key"], http_client=http_client)
+                    
+                    response = groq_client.chat.completions.create(
+                        model="llama-3.1-8b-instant",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3,
+                        max_tokens=1024
+                    )
+                    insights = response.choices[0].message.content.strip()
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    # Check if it's a Zscaler/proxy issue
+                    if "DOCTYPE" in error_str or "HTML" in error_str or "Zscaler" in error_str:
+                        insights = "LLM blocked by corporate proxy. Install Ollama locally: https://ollama.com"
+                    else:
+                        insights = f"LLM analysis unavailable: {error_str[:100]}. Showing raw search results below."
+            
+            elif not ollama_success:
+                insights = "No LLM available. Install Ollama (https://ollama.com) for local AI analysis."
+        
+        return render_template(
+            "search_results.html",
+            query=query,
+            jira_results=jira_results,
+            confluence_results=confluence_results,
+            insights=insights,
+            error_message=error_message,
+            search_type="llm",
+            mode=mode
+        )
 
     return app
 

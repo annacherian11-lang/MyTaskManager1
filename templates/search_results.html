@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Search Results - {{ query }}{% endblock %}
+
+{% block content %}
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+      <h2 class="text-white mb-1">Search Results</h2>
+      <p class="text-soft mb-0">Results for: <strong class="text-white">"{{ query }}"</strong></p>
+    </div>
+    <a href="{{ url_for('search_insights') }}" class="btn btn-outline-light btn-sm">New Search</a>
+  </div>
+
+  {% if error_message %}
+    <div class="alert alert-warning">{{ error_message }}</div>
+  {% endif %}
+
+  <!-- Search Type Badge -->
+  <div class="mb-3">
+    {% if search_type == "llm" %}
+      <span class="badge bg-info">LLM Search</span>
+    {% else %}
+      <span class="badge bg-secondary">Phrase Search</span>
+    {% endif %}
+  </div>
+
+  <!-- LLM Insights (only for LLM search) -->
+  {% if insights %}
+  <div class="card bg-blur border-0 rounded-4 p-4 mb-4" style="border-left: 4px solid #17a2b8 !important;">
+    <h5 class="text-white mb-3">AI Analysis</h5>
+    <div class="text-soft" style="white-space: pre-wrap;">{{ insights }}</div>
+  </div>
+  {% endif %}
+
+  <!-- Summary -->
+  <div class="card bg-blur border-0 rounded-4 p-3 mb-4">
+    <div class="text-white">
+      Found <strong>{{ jira_results|length }}</strong> JIRA issues and 
+      <strong>{{ confluence_results|length }}</strong> Confluence pages matching "<strong>{{ query }}</strong>"
+    </div>
+  </div>
+
+  <div class="row">
+    <!-- JIRA Results -->
+    <div class="col-md-6 mb-4">
+      <div class="card bg-blur border-0 rounded-4 p-3 h-100">
+        <h5 class="text-white mb-3">
+          JIRA Issues 
+          <span class="badge bg-primary">{{ jira_results|length }}</span>
+        </h5>
+        
+        {% if jira_results %}
+          <div class="list-group list-group-flush" style="max-height: 500px; overflow-y: auto;">
+            {% for item in jira_results %}
+            <div class="list-group-item bg-transparent border-secondary text-white mb-2 rounded">
+              <div class="d-flex justify-content-between align-items-start">
+                <a href="{{ item.url }}" target="_blank" class="text-info text-decoration-none fw-semibold">
+                  {{ item.key }}
+                </a>
+                <span class="badge bg-secondary">{{ item.status }}</span>
+              </div>
+              <div class="small mt-1">{{ item.summary }}</div>
+              {% if item.description %}
+                <div class="text-soft small mt-1" style="font-size: 0.75rem;">
+                  {{ item.description }}...
+                </div>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-soft">No JIRA issues found.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Confluence Results -->
+    <div class="col-md-6 mb-4">
+      <div class="card bg-blur border-0 rounded-4 p-3 h-100">
+        <h5 class="text-white mb-3">
+          Confluence Pages 
+          <span class="badge bg-success">{{ confluence_results|length }}</span>
+        </h5>
+        
+        {% if confluence_results %}
+          <div class="list-group list-group-flush" style="max-height: 500px; overflow-y: auto;">
+            {% for item in confluence_results %}
+            <div class="list-group-item bg-transparent border-secondary text-white mb-2 rounded">
+              <div class="d-flex justify-content-between align-items-start">
+                <a href="{{ item.url }}" target="_blank" class="text-info text-decoration-none fw-semibold">
+                  {{ item.title }}
+                </a>
+                <span class="badge bg-secondary">{{ item.space }}</span>
+              </div>
+              {% if item.preview %}
+                <div class="text-soft small mt-1" style="font-size: 0.75rem;">
+                  {{ item.preview }}...
+                </div>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-soft">No Confluence pages found.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="text-center">
+    <a href="{{ url_for('home') }}" class="btn btn-outline-light btn-sm">Back to Dashboard</a>
+  </div>
+</div>
+{% endblock %}

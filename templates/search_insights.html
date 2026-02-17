@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Search JIRA & Confluence{% endblock %}
+
+{% block content %}
+<div class="container py-4">
+  <div class="row justify-content-center">
+    <div class="col-md-10">
+      <div class="card bg-blur border-0 rounded-4 p-4 mb-4">
+        <h2 class="text-white mb-3">Search JIRA & Confluence</h2>
+        <p class="text-soft mb-4">
+          Choose a search method to find content across JIRA issues and Confluence pages.
+        </p>
+      </div>
+      
+      <div class="row g-4">
+        <!-- Phrase Matching Search -->
+        <div class="col-md-6">
+          <div class="card bg-blur border-0 rounded-4 p-4 h-100">
+            <h4 class="text-white mb-2">Search via Phrase Matching</h4>
+            <p class="text-soft small mb-3">
+              Fast keyword-based search. Matches exact words in titles and content.
+              Best for specific terms you know exist.
+            </p>
+            <ul class="text-soft small mb-3">
+              <li>Searches JIRA summary & description</li>
+              <li>Searches Confluence title & content</li>
+              <li>All words must match (AND logic)</li>
+            </ul>
+            <a href="{{ url_for('search_phrase') }}" class="btn btn-light fw-semibold">
+              Phrase Search
+            </a>
+          </div>
+        </div>
+        
+        <!-- LLM Search -->
+        <div class="col-md-6">
+          <div class="card bg-blur border-0 rounded-4 p-4 h-100">
+            <h4 class="text-white mb-2">Search via LLM</h4>
+            <p class="text-soft small mb-3">
+              Intelligent semantic search. Understands meaning and context.
+              Best for natural language queries.
+            </p>
+            <ul class="text-soft small mb-3">
+              <li>Understands query intent</li>
+              <li>Filters irrelevant results</li>
+              <li>Provides context-aware insights</li>
+            </ul>
+            <a href="{{ url_for('search_llm') }}" class="btn btn-outline-light fw-semibold">
+              LLM Search
+            </a>
+          </div>
+        </div>
+      </div>
+      
+      <div class="text-center mt-4">
+        <a href="{{ url_for('home') }}" class="btn btn-outline-light btn-sm">Back to Dashboard</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

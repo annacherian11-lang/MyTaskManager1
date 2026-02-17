@@ -72,6 +72,15 @@
                 <a href="{{ url_for('describe_process') }}" class="btn btn-sm btn-outline-light">Open</a>
               </div>
             </div>
+            <div class="col-md-3">
+              <div class="p-3 rounded-4 bg-dark bg-opacity-25 border border-white border-opacity-10 h-100">
+                <div class="fw-semibold mb-1">Search JIRA & Confluence</div>
+                <div class="text-soft small mb-2">
+                  Search across JIRA issues and Confluence pages.
+                </div>
+                <a href="{{ url_for('search_insights') }}" class="btn btn-sm btn-outline-light">Open</a>
+              </div>
+            </div>
           </div>
         {% else %}
           <div class="row g-3">
